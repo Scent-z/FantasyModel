@@ -1,2 +1,2 @@
 # FantasyModel
-从零开始，逐行全流程实现LLM，种下一颗种子
+Building an LLM from Scratch—A Complete, Line-by-Line Implementation—Sowing a Seed

@@ -10,7 +10,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 """
-模型v0版本
+FantasyModel v0版本
 
 """
 
@@ -31,7 +31,6 @@ class ModelConfig(PretrainedConfig):
             vocab_size: int = 6400,
             rms_norm_eps: float = 1e-05,
             rope_theta: int = 1000000.0,
-            inference_rope_scaling: bool = False,
             # PyTorch 2.0+ 内置的 Flash Attention 实现（通过 torch.nn.functional.scaled_dot_product_attention），用于加速注意力计算，和 GQA无关
             flash_attn: bool = True,
             **kwargs
@@ -50,10 +49,8 @@ class ModelConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
-        self.inference_rope_scaling = inference_rope_scaling
-
         self.flash_attn = flash_attn
-
+    
 
 # RMSNorm不减均值，只缩放；LayerNorm减均值，平移+缩放。RMSNorm更快，更稳定
 class RMSNorm(torch.nn.Module):
@@ -84,8 +81,9 @@ def precompute_freqs_cis(dim: int,  # 每个 head 的维度
 
     # 外积计算所有位置的角度
     t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor  # 复制两次，前后配对而不是相邻配对，更方便更工程化
+    freqs = torch.outer(t, freqs).float()  # 每个位置、每个维度组对应的旋转角度  角度 = 位置 × 频率 
+    # x' = x cosθ - y sinθ  y' = x sinθ + y cosθ
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor  # 复制两次，本项目选取前后配对而不是相邻配对，更方便更工程化
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
     # 最终输出形状freqs_cos.shape = [end, dim]，freqs_sin.shape = [end, dim]
     return freqs_cos, freqs_sin
@@ -97,8 +95,10 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     def rotate_half(x):
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
 
-    q_embed = (q * cos.unsqueeze(unsqueeze_dim = 1)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim = 1))
-    k_embed = (k * cos.unsqueeze(unsqueeze_dim = 1)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim = 1))
+    # q_embed = (q * cos.unsqueeze(unsqueeze_dim = 1)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim = 1))
+    # k_embed = (k * cos.unsqueeze(unsqueeze_dim = 1)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim = 1))
+    q_embed = (q * cos.unsqueeze(1)) + (rotate_half(q) * sin.unsqueeze(1))
+    k_embed = (k * cos.unsqueeze(1)) + (rotate_half(k) * sin.unsqueeze(1))
     return q_embed, k_embed
 
 
@@ -112,7 +112,6 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
-# 将两层注意力机制写为一个类
 class Attention(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
@@ -152,7 +151,7 @@ class Attention(nn.Module):
         xk = xk.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
 
-        # Decoder-only 必须用 RoPE原因是1、天然支持自回归 2、支持 KV cache 3、支持长度外推（YaRN）
+        # Decoder-only 用 RoPE原因是1、天然支持自回归 2、支持 KV cache 3、支持长度外推（YaRN）
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])  # 注意切片
 
@@ -160,6 +159,8 @@ class Attention(nn.Module):
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
+        
+        # 一层 cache 是一个二元组(key_cache, value_cache) [B, past_len, num_kv_heads, head_dim] [B, past_len, num_kv_heads, head_dim]
         # 存储新的 cache，是否把新的 KV 返回，供下一步使用  
         past_kv = (xk, xv) if use_cache else None
 
@@ -210,14 +211,14 @@ class FeedForward(nn.Module):
         if config.intermediate_size is None:  
             intermediate_size = int(config.hidden_size * 8 / 3)  # 确保 SwiGLU 架构的参数量与传统 FFN 相同
             config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)  # 对齐到硬件友好的数值，GPU友好，提升训练性能
-            # 偷懒可以这样写，刚好对齐时会增加一些开销config.intermediate_size = 64 * (intermediate_size // 64 + 1) 
+            # 偷懒可以这样写，但是如果是刚好对齐时会增加一些开销config.intermediate_size = 64 * (intermediate_size // 64 + 1) 
         
         # SwiGLU（Swish-Gated Linear Unit）激活函数，引入了Swish门控，让模型可以动态地"开/关"特征通道，更灵活地控制信息流，在相同参数量下获得更好性能
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)    
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)  # 也把输入升维，但不是直接提供内容，而是生成一个“开关”，决定哪些维度该放大？哪些维度该压下去？
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)  # 把输入特征升维，生成候选信息
         self.dropout = nn.Dropout(config.dropout)
-        self.act_fn = ACT2FN[config.hidden_act]  # ACT2FN 是一个激活函数映射字典，作用是将字符串标识符转换为对应的 PyTorch 激活函数
+        self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         # gate_proj + act_fn 产生一个"门控值"，up_proj 产生"信息内容"，相乘让门控值控制哪些信息通过、哪些被抑制
@@ -273,13 +274,23 @@ class Model(nn.Module):
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
-                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                # 训练模式：past_key_values = None，use_cache = False 推理模式：past_key_values ≠ None，use_cache = True
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,  
                 use_cache: bool = False,
                 **kwargs):
         batch_size, seq_length = input_ids.shape
-        if hasattr(past_key_values, 'layers'): past_key_values = None
-        past_key_values = past_key_values or [None] * len(self.layers)
-        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        # 可能是作者在最初测试时遇到一个bug，这里是为了防止该特殊情况
+        if hasattr(past_key_values, 'layers'): 
+            past_key_values = None
+
+        # 每层都要有 cache, 因为每一层 Attention 都会产生自己的 K/V
+        past_key_values = past_key_values or [None] * len(self.layers)  # A or B，若A为真则返回A，否则返回B
+ 
+        if past_key_values[0] is not None:
+            start_pos = past_key_values[0][0].shape[1]  # 第0层的 K cache  past_key_values[0][0].shape[1] = past_len 即之前已经生成/缓存了多少个 token
+        else:
+            start_pos = 0  # start_pos 决定 RoPE 的起始位置
 
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
@@ -288,20 +299,20 @@ class Model(nn.Module):
             self.freqs_sin[start_pos:start_pos + seq_length]
         )
 
-        presents = []
-        for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
-            hidden_states, present = layer(
+        all_key_value = []
+        for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):  # 逐层 Transformer
+            hidden_states, present_key_value = layer(
                 hidden_states,
                 position_embeddings,
                 past_key_value=past_key_value,
                 use_cache=use_cache,
                 attention_mask=attention_mask
             )
-            presents.append(present)
+            all_key_value.append(present_key_value)
 
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, presents
+        return hidden_states, all_key_value
 
 
 class ModelForCausalLM(PreTrainedModel, GenerationMixin):  # 继承 GenerationMixin：获得文本生成的采样、贪婪解码等方法

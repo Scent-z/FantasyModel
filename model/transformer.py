@@ -48,7 +48,7 @@ class PositionalEncoding(nn.Module):
         x = x + Variable(self.pe[:, :x.size(1)], 
                          requires_grad=False)
         return self.dropout(x)
-
+    
 
 # attention返回两个东西context（加权后的 value，记作 x，这是 attention 的主要输出，会用于后续拼接多头并线性投影）与p_attn（注意力权重矩阵，表示每个 Query 在各个 Key 上的注意力分布）
 def attention(query, key, value, mask, dropout=None):
